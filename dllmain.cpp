@@ -9,22 +9,44 @@
 #pragma warning(pop)
 
 #define PLUGIN_NAME "REFramework-SpecialK"
+#define LOG_INFO(f, ...) reframework::API::get()->log_info(PLUGIN_NAME ": " f, __VA_ARGS__);
+#define LOG_INFO0(s) LOG_INFO("%s", s)
 #define LOG_ERROR(f, ...) reframework::API::get()->log_error(PLUGIN_NAME ": " f, __VA_ARGS__);
 #define LOG_ERROR0(s) LOG_ERROR("%s", s)
 
 namespace {
 HMODULE hThisModule;
 
-std::optional<std::wstring> GetModulePath(HMODULE hModule) {
-    WCHAR wcModuleFilename[MAX_PATH + 1];
-    const DWORD szModuleFilename = GetModuleFileName(
-            hModule, wcModuleFilename, MAX_PATH);
-    if (szModuleFilename == 0) {
+class RegKeyCloseGuard {
+public:
+    RegKeyCloseGuard(HKEY hKey): hKey_(hKey) {}
+    ~RegKeyCloseGuard() {
+        RegCloseKey(hKey_);
+    }
+    RegKeyCloseGuard(const RegKeyCloseGuard &) = delete;
+    RegKeyCloseGuard &operator=(const RegKeyCloseGuard &) = delete;
+private:
+    HKEY hKey_;
+};
+
+std::optional<std::wstring> GetSpecialKPathFromRegistry() {
+    HKEY hKey;
+    const auto regOpenStatus{ RegOpenKeyEx(
+        HKEY_CURRENT_USER, L"Software\\Kaldaien\\Special K",
+        0, KEY_QUERY_VALUE, &hKey) };
+    if (regOpenStatus != ERROR_SUCCESS) {
         return std::nullopt;
     }
-    const std::wstring moduleFilename{ wcModuleFilename };
-    const size_t lastSlash = moduleFilename.find_last_of(L'\\');
-    return { std::wstring { moduleFilename.substr(0, lastSlash + 1) } };
+    RegKeyCloseGuard hKeyGuard{ hKey };
+    WCHAR buffer[MAX_PATH + 1];
+    DWORD szBuffer{ MAX_PATH + 1 };
+    const auto regGetValueStatus{ RegGetValue(
+        hKey, NULL, L"Path", RRF_RT_REG_SZ, NULL, buffer, &szBuffer
+    ) };
+    if (regGetValueStatus != ERROR_SUCCESS) {
+        return std::nullopt;
+    }
+    return std::wstring{ buffer };
 }
 
 } // anonymous namespace
@@ -32,32 +54,20 @@ std::optional<std::wstring> GetModulePath(HMODULE hModule) {
 extern "C" __declspec(dllexport) bool reframework_plugin_initialize(const REFrameworkPluginInitializeParam *param) {
     reframework::API::initialize(param);
 
-   auto &&modulePath{ GetModulePath(hThisModule) };
-    if (!modulePath) {
-        LOG_ERROR0("GetModulePath failed");
+    auto &&skRegistryPath{ GetSpecialKPathFromRegistry() };
+    if (!skRegistryPath) {
+        LOG_ERROR0("GetSpecialKPathFromRegistry failed (perhaps Special K is not properly installed?)");
         return false;
     }
 
-    auto skLoadPath{ *modulePath + L"SpecialK\\SpecialK64.dll" };
+    LOG_INFO0("Attempting to load SpecialK...");
+    auto skLoadPath{ *skRegistryPath + L"\\SpecialK64.dll" };
     auto skModule{ LoadLibrary(skLoadPath.c_str()) };
     if (!skModule) {
-        const auto skPathLength{ skLoadPath.length() + 1 };
-        auto narrowPathBuffer{ std::make_unique<char>(skPathLength) };
-        if (!WideCharToMultiByte(
-            CP_ACP,                 // CodePage
-            0,                      // dwFlags
-            skLoadPath.c_str(),     // lpWideCharStr
-            skPathLength,           // cchWideChar
-            narrowPathBuffer.get(), // lpMultiByteStr
-            skPathLength,           // cbMultiByte
-            NULL,                   // lpDefaultChar
-            NULL                    // lpUsedDefaultChar
-        )) {
-            strcpy_s(narrowPathBuffer.get(), skPathLength, "unknown path");
-        }
-        LOG_ERROR("%s %s", "Failed to load SpecialK from", narrowPathBuffer.get());
+        LOG_ERROR("%s %s", "Failed to load SpecialK");
         return false;
     }
+    LOG_INFO0("Successfully loaded SpecialK");
     return true;
 }
 
