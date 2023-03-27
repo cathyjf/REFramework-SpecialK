@@ -1,0 +1,4 @@
+[submodule "REFramework"]
+	path = externals/REFramework
+	url = https://github.com/praydog/REFramework
+	ignore = dirty
