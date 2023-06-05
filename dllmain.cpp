@@ -5,11 +5,14 @@
 #include <string>
 
 #pragma warning(push)
-#pragma warning(disable : 4267)
+#pragma warning(disable : 4267 26110)
 #include "externals/REFramework/include/reframework/API.hpp"
 #pragma warning(pop)
 
+#pragma warning(push)
+#pragma warning(disable : 26827)
 #include "externals/reshade/include/reshade.hpp"
+#pragma warning(pop)
 
 #include "dxgi.proxydll.h"
 
@@ -174,9 +177,9 @@ void doProcessAttach(HMODULE hModule) {
     DisableThreadLibraryCalls(hModule);
     const DWORD szBuffer{ MAX_PATH + 1 };
     WCHAR buffer[szBuffer];
-    const DWORD nSize{ GetModuleFileName(hModule, buffer, szBuffer) };
+    const auto nSize{ GetModuleFileName(hModule, buffer, szBuffer) };
     if (nSize != 0) {
-        const std::wstring dllName{ std::filesystem::path{ buffer }.filename() };
+        const auto dllName{ std::filesystem::path{ buffer }.filename() };
         if (dllName == L"dxgi.dll") {
             spawnSKIFThread(false);
         }
@@ -202,6 +205,14 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE /*
     return true;
 }
 
+extern "C" __declspec(dllexport) void AddonUninit(HMODULE addon_module, HMODULE /*reshade_module*/) {
+    if (!bUsingReShade) {
+        return;
+    }
+    unregisterReShadeEvent();
+    reshade::unregister_addon(addon_module);
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpReserved*/) {
     switch (ul_reason_for_call) {
     case DLL_PROCESS_ATTACH:
@@ -212,10 +223,6 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID /*lpRese
     case DLL_THREAD_DETACH:
         break;
     case DLL_PROCESS_DETACH:
-        if (bUsingReShade) {
-            unregisterReShadeEvent();
-            reshade::unregister_addon(hModule);
-        }
         break;
     }
     return TRUE;
