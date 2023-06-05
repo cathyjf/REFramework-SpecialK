@@ -2,3 +2,6 @@
 	path = externals/REFramework
 	url = https://github.com/praydog/REFramework
 	ignore = dirty
+[submodule "externals/reshade"]
+	path = externals/reshade
+	url = https://github.com/crosire/reshade
