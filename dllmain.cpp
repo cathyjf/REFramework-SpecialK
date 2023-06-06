@@ -1,4 +1,5 @@
 #include "pch.h"
+#include <array>
 #include <filesystem>
 #include <memory>
 #include <optional>
@@ -17,10 +18,8 @@
 #include "dxgi.proxydll.h"
 
 namespace {
-bool bUsingREFramework = false;
-bool bUsingReShade = false;
-bool bTriedLoadingSpecialK = false;
-bool bLoadedSpecialK = false;
+auto bUsingREFramework = false;
+auto bUsingReShade = false;
 
 class RegKeyCloseGuard {
 public:
@@ -36,22 +35,22 @@ private:
 
 std::optional<std::wstring> GetSpecialKPathFromRegistry() {
     HKEY hKey;
-    const auto regOpenStatus{ RegOpenKeyEx(
+    const auto regOpenStatus = RegOpenKeyEx(
         HKEY_CURRENT_USER, L"Software\\Kaldaien\\Special K",
-        0, KEY_QUERY_VALUE, &hKey) };
+        0, KEY_QUERY_VALUE, &hKey);
     if (regOpenStatus != ERROR_SUCCESS) {
         return std::nullopt;
     }
-    RegKeyCloseGuard hKeyGuard{ hKey };
-    WCHAR buffer[MAX_PATH + 1];
-    DWORD szBuffer{ MAX_PATH + 1 };
-    const auto regGetValueStatus{ RegGetValue(
-        hKey, NULL, L"Path", RRF_RT_REG_SZ, NULL, buffer, &szBuffer
-    ) };
+    const auto hKeyGuard{ RegKeyCloseGuard{ hKey } };
+    auto buffer{ std::array<WCHAR, MAX_PATH + 1>{} };
+    auto szBuffer = DWORD{ MAX_PATH + 1 };
+    const auto regGetValueStatus = RegGetValue(
+        hKey, NULL, L"Path", RRF_RT_REG_SZ, NULL, buffer.data(), &szBuffer
+    );
     if (regGetValueStatus != ERROR_SUCCESS) {
         return std::nullopt;
     }
-    return std::wstring{ buffer };
+    return std::wstring{ buffer.data() };
 }
 
 void writeLogMessage(const char *message) {
@@ -64,16 +63,12 @@ void writeLogMessage(const char *message) {
 }
 
 bool executeExe(LPCWSTR filename, WCHAR commandLine[], bool waitForExe = false) {
-    STARTUPINFO startupInfo;
-    ZeroMemory(&startupInfo, sizeof(startupInfo));
-    startupInfo.cb = sizeof(startupInfo);
-
-    PROCESS_INFORMATION processInformation;
-    ZeroMemory(&processInformation, sizeof(processInformation));
+    auto startupInfo{ STARTUPINFO{ .cb{ sizeof(STARTUPINFO) } } };
+    auto processInformation{ PROCESS_INFORMATION{} };
 
     // Note: The string used to hold the command line cannot be const because
     // the CreateProcess function reserves the right to modify the string.
-    const BOOL bSuccess = CreateProcess(
+    const auto bSuccess = CreateProcess(
             filename,
             commandLine,
             NULL,  // lpProcessAttributes
@@ -97,8 +92,8 @@ bool executeExe(LPCWSTR filename, WCHAR commandLine[], bool waitForExe = false) 
 }
 
 bool tryLoadSpecialK(bool bUseLoadLibrary = true) {
-    constexpr LPCWSTR lpMutexName{ L"Local\\REFrameworkSpecialKRunOnceMutex" };
-    auto&& hMutex{ CreateMutex(NULL, TRUE, lpMutexName) };
+    constexpr auto lpMutexName{ L"Local\\REFrameworkSpecialKRunOnceMutex" };
+    const auto &&hMutex{ CreateMutex(NULL, TRUE, lpMutexName) };
     if (!hMutex) {
         return 1;
     }
@@ -106,13 +101,15 @@ bool tryLoadSpecialK(bool bUseLoadLibrary = true) {
         return 1;
     }
 
+    static auto bLoadedSpecialK = false;
+    static auto bTriedLoadingSpecialK = false;
     if (bTriedLoadingSpecialK) {
         writeLogMessage("Ignored second attempt to load SpecialK");
         return bLoadedSpecialK;
     }
     bTriedLoadingSpecialK = true;
 
-    auto &&skRegistryPath{ GetSpecialKPathFromRegistry() };
+    const auto &&skRegistryPath{ GetSpecialKPathFromRegistry() };
     if (!skRegistryPath) {
         writeLogMessage("GetSpecialKPathFromRegistry failed (perhaps Special K is not properly installed?)");
         return false;
@@ -121,17 +118,17 @@ bool tryLoadSpecialK(bool bUseLoadLibrary = true) {
     writeLogMessage("Attempting to load SpecialK...");
 
     if (bUseLoadLibrary) {
-        auto skLoadPath{ *skRegistryPath + L"\\SpecialK64.dll" };
-        auto skModule{ LoadLibrary(skLoadPath.c_str()) };
+        const auto skLoadPath{ *skRegistryPath + L"\\SpecialK64.dll" };
+        const auto skModule = LoadLibrary(skLoadPath.c_str());
         if (!skModule) {
             writeLogMessage("Failed to load SpecialK");
             return false;
         }
         writeLogMessage("Successfully loaded SpecialK");
     } else {
-        auto skLoadPath{ *skRegistryPath + L"\\SKIF.exe" };
-        WCHAR commandLine[]{L"SKIF.exe Start Temp"};
-        if (executeExe(skLoadPath.c_str(), commandLine)) {
+        const auto skLoadPath{ *skRegistryPath + L"\\SKIF.exe" };
+        auto commandLine{ std::to_array(L"SKIF.exe Start Temp") };
+        if (executeExe(skLoadPath.c_str(), commandLine.data())) {
             writeLogMessage("Successfully ran `SKIF Start Temp`");
         }
     }
@@ -142,11 +139,11 @@ bool tryLoadSpecialK(bool bUseLoadLibrary = true) {
 void spawnSKIFQuitThread() {
     CreateThread(NULL, 0, [](LPVOID) -> DWORD {
         Sleep(4 * 1000);
-        auto&& skRegistryPath{ GetSpecialKPathFromRegistry() };
+        const auto &&skRegistryPath{ GetSpecialKPathFromRegistry() };
         if (skRegistryPath) {
-            auto skLoadPath{ *skRegistryPath + L"\\SKIF.exe" };
-            WCHAR commandLine[]{ L"SKIF.exe Quit" };
-            if (executeExe(skLoadPath.c_str(), commandLine)) {
+            const auto skLoadPath{ *skRegistryPath + L"\\SKIF.exe" };
+            auto commandLine{ std::to_array(L"SKIF.exe Quit") };
+            if (executeExe(skLoadPath.c_str(), commandLine.data())) {
                 writeLogMessage("Successfully ran `SKIF Quit`");
             }
         }
@@ -175,14 +172,15 @@ void unregisterReShadeEvent() {
 
 void doProcessAttach(HMODULE hModule) {
     DisableThreadLibraryCalls(hModule);
-    const DWORD szBuffer{ MAX_PATH + 1 };
-    WCHAR buffer[szBuffer];
-    const auto nSize{ GetModuleFileName(hModule, buffer, szBuffer) };
-    if (nSize != 0) {
-        const auto dllName{ std::filesystem::path{ buffer }.filename() };
-        if (dllName == L"dxgi.dll") {
-            spawnSKIFThread(false);
-        }
+    const auto szBuffer = MAX_PATH + 1;
+    auto buffer{ std::array<WCHAR, szBuffer>{} };
+    const auto nSize = GetModuleFileName(hModule, buffer.data(), szBuffer);
+    if (nSize == 0) {
+        return;
+    }
+    const auto dllName{ std::filesystem::path{ buffer.data() }.filename() };
+    if (dllName == L"dxgi.dll") {
+        spawnSKIFThread(false);
     }
 }
 
