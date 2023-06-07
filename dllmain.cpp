@@ -105,20 +105,52 @@ void writeLogMessage(const char *message) {
     }
 }
 
+template <class T = wchar_t>
+std::vector<T> getModifiedEnvironmentBlock() {
+    auto buffer = ([]() {
+        // Populate a vector with the existing environment.
+        auto buffer = std::vector<T>{};
+        struct Deleter {
+            void operator()(T* strings) {
+                FreeEnvironmentStrings(strings);
+            }
+        };
+        const auto block = std::unique_ptr<T[], Deleter>{ GetEnvironmentStrings() };
+        for (auto i = 0; ; ++i) {
+            buffer.emplace_back(block[i]);
+            if (block[i] != '\0') {
+                continue;
+            }
+            if ((i == '\0') || (block[i + 1] == '\0')) {
+                break;
+            }
+        }
+        return buffer;
+    })();
+    // Add our new environment variable to the buffer.
+    constexpr T newEnv[] = L"SteamNoOverlayUIDrawing=1";
+    constexpr auto newEnvLength = sizeof(newEnv) / sizeof(newEnv[0]);
+    buffer.insert(buffer.end(), newEnv, newEnv + newEnvLength);
+    // The environment block requires a final null terminator.
+    buffer.emplace_back('\0');
+    return buffer;
+}
+
 bool executeExe(LPCWSTR filename, WCHAR commandLine[], bool waitForExe = false, bool addToJob = false) {
     auto startupInfo{ STARTUPINFO{ .cb{ sizeof(STARTUPINFO) } } };
     auto processInformation{ PROCESS_INFORMATION{} };
 
     // Note: The string used to hold the command line cannot be const because
     // the CreateProcess function reserves the right to modify the string.
+    auto environment = getModifiedEnvironmentBlock();
     const auto bSuccess = CreateProcess(
             filename,
             commandLine,
             NULL,  // lpProcessAttributes
             NULL,  // lpThreadAttributes
             FALSE, // bInheritHandles
-            0,     // dwCreationFlags
-            NULL,  // lpEnvironment
+            CREATE_UNICODE_ENVIRONMENT, // dwCreationFlags
+            &environment[0],            // lpEnvironment
             NULL,  // lpCurrentDirectory
             &startupInfo,
             &processInformation);
