@@ -25,6 +25,16 @@ auto bUsingReShade = false;
 auto bUsingReShadeYuzu = false;
 auto bEnableReShadeYuzuEffects = false;
 
+std::filesystem::path getModulePath(const HMODULE module) {
+    constexpr auto szBuffer = MAX_PATH + 1;
+    auto buffer{ std::array<WCHAR, szBuffer>{} };
+    const auto nSize = GetModuleFileNameW(module, buffer.data(), szBuffer);
+    if (nSize == 0) [[unlikely]] {
+        return {};
+    }
+    return buffer.data();
+}
+
 std::optional<std::wstring> GetSpecialKPathFromRegistry() {
     HKEY hKey;
     const auto regOpenStatus = RegOpenKeyEx(
@@ -59,21 +69,17 @@ void writeLogMessage(const char *message) {
         const auto finalMessage{ std::string{ "SpecialK Companion: " } + message };
         reshade::log_message(reshade::log_level::info, finalMessage.c_str());
     }
-    static std::mutex mutex;
-    std::scoped_lock lock{ mutex };
+    static auto mutex = std::mutex{};
+    const auto lock = std::scoped_lock{ mutex };
     static auto exeName = std::string{};
     static auto logStream = ([]() -> std::ofstream {
         const auto logPath = ([]() -> std::wstring {
-            const auto szBuffer = MAX_PATH + 1;
-            auto buffer{ std::array<WCHAR, szBuffer>{} };
-            const auto nSize = GetModuleFileName(NULL, buffer.data(), szBuffer);
-            if (nSize == 0) [[unlikely]] {
+            auto exePath = getModulePath(NULL);
+            if (exePath.empty()) [[unlikely]] {
                 return {};
             }
-            exeName = std::filesystem::path{ buffer.data() }.filename().string();
-            return std::filesystem::path{ buffer.data() }
-                .replace_filename(L"SpecialK-Companion.log")
-                .wstring();
+            exeName = exePath.filename().string();
+            return exePath.replace_filename(L"SpecialK-Companion.log").wstring();
         })();
         if (logPath.empty()) [[unlikely]] {
             return {};
@@ -114,11 +120,12 @@ std::vector<T> getModifiedEnvironmentBlock() {
         };
         const auto block = std::unique_ptr<T[], Deleter>{ GetEnvironmentStrings() };
         for (auto i = 0; ; ++i) {
-            buffer.emplace_back(block[i]);
-            if (block[i] != '\0') {
-                continue;
+            const auto isNull = (block[i] == '\0');
+            if (isNull && (i == 0)) {
+                break;
             }
-            if ((i == '\0') || (block[i + 1] == '\0')) {
+            buffer.emplace_back(block[i]);
+            if (isNull && (block[i + 1] == '\0')) {
                 break;
             }
         }
@@ -309,13 +316,11 @@ void doProcessAttach(HMODULE hModule) {
     auto data = new ThreadData{ hModule };
     CreateThread(NULL, 0, [](LPVOID lpData) -> DWORD {
         const auto data = std::unique_ptr<ThreadData>{ reinterpret_cast<ThreadData *>(lpData) };
-        constexpr auto szBuffer = MAX_PATH + 1;
-        auto buffer{ std::array<WCHAR, szBuffer>{} };
-        const auto nSize = GetModuleFileName(data->hModule, buffer.data(), szBuffer);
-        if (nSize == 0) {
+        const auto path{ getModulePath(data->hModule) };
+        if (path.empty()) [[unlikely]] {
             return 0;
         }
-        const auto dllName{ std::filesystem::path{ buffer.data() }.filename() };
+        const auto dllName{ path.filename() };
         if (dllName == L"dxgi.dll") {
             tryLoadSpecialK(false);
         }
@@ -341,17 +346,15 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE /*
     reshade::register_event<reshade::addon_event::init_effect_runtime>(&onReShadeCreateEffectRuntime);
     writeLogMessage("Add-on successfully registered");
 
-    const auto szBuffer = MAX_PATH + 1;
-    auto buffer{ std::array<WCHAR, szBuffer>{} };
-    const auto nSize = GetModuleFileName(NULL, buffer.data(), szBuffer);
-    if (nSize != 0) {
-        const auto exeName{ std::filesystem::path{ buffer.data() }.filename() };
-        if (exeName == L"yuzu.exe") {
-            bUsingReShadeYuzu = true;
-            writeLogMessage("Detected running of Yuzu with ReShade");
-        }
+    const auto path{ getModulePath(NULL) };
+    if (path.empty()) [[unlikely]] {
+        return true;
     }
-
+    const auto exeName{ path.filename() };
+    if (exeName == L"yuzu.exe") {
+        bUsingReShadeYuzu = true;
+        writeLogMessage("Detected running of Yuzu with ReShade");
+    }
     return true;
 }
 
