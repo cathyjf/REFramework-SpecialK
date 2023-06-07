@@ -25,18 +25,6 @@ auto bUsingReShade = false;
 auto bUsingReShadeYuzu = false;
 auto bEnableReShadeYuzuEffects = false;
 
-class RegKeyCloseGuard {
-public:
-    RegKeyCloseGuard(HKEY hKey): hKey_(hKey) {}
-    ~RegKeyCloseGuard() {
-        RegCloseKey(hKey_);
-    }
-    RegKeyCloseGuard(const RegKeyCloseGuard &) = delete;
-    RegKeyCloseGuard &operator=(const RegKeyCloseGuard &) = delete;
-private:
-    HKEY hKey_;
-};
-
 std::optional<std::wstring> GetSpecialKPathFromRegistry() {
     HKEY hKey;
     const auto regOpenStatus = RegOpenKeyEx(
@@ -45,7 +33,13 @@ std::optional<std::wstring> GetSpecialKPathFromRegistry() {
     if (regOpenStatus != ERROR_SUCCESS) {
         return std::nullopt;
     }
-    const auto hKeyGuard{ RegKeyCloseGuard{ hKey } };
+    struct RegKeyCloser {
+        typedef HKEY pointer;
+        void operator()(HKEY hKey) {
+            RegCloseKey(hKey);
+        }
+    };
+    const auto hKeyGuard = std::unique_ptr<HKEY, RegKeyCloser>{ hKey };
     auto buffer{ std::array<WCHAR, MAX_PATH + 1>{} };
     auto szBuffer = DWORD{ MAX_PATH + 1 };
     const auto regGetValueStatus = RegGetValue(
@@ -67,24 +61,26 @@ void writeLogMessage(const char *message) {
     }
     static std::mutex mutex;
     std::scoped_lock lock{ mutex };
-    static auto logStream = ([]() -> std::optional<std::ofstream> {
-        const auto logPath = ([]() -> std::optional<std::wstring> {
+    static auto exeName = std::string{};
+    static auto logStream = ([]() -> std::ofstream {
+        const auto logPath = ([]() -> std::wstring {
             const auto szBuffer = MAX_PATH + 1;
             auto buffer{ std::array<WCHAR, szBuffer>{} };
             const auto nSize = GetModuleFileName(NULL, buffer.data(), szBuffer);
             if (nSize == 0) [[unlikely]] {
-                return std::nullopt;
+                return {};
             }
+            exeName = std::filesystem::path{ buffer.data() }.filename().string();
             return std::filesystem::path{ buffer.data() }
                 .replace_filename(L"SpecialK-Companion.log")
                 .wstring();
         })();
-        if (!logPath) [[unlikely]] {
-            return std::nullopt;
+        if (logPath.empty()) [[unlikely]] {
+            return {};
         }
-        return std::ofstream{ *logPath };
+        return std::ofstream{ logPath };
     })();
-    if (logStream) {
+    if (logStream.is_open()) {
         const auto timeString = ([]() -> std::string {
             const auto time = std::time(nullptr);
             if (time == -1) [[unlikely]] {
@@ -101,7 +97,8 @@ void writeLogMessage(const char *message) {
             }
             return "[" + std::string{ buffer.data() } + "] ";
         })();
-        *logStream << timeString << message << std::endl;
+        const auto exeString = "[" + exeName + "] ";
+        logStream << exeString << timeString << message << std::endl;
     }
 }
 
@@ -111,7 +108,7 @@ std::vector<T> getModifiedEnvironmentBlock() {
         // Populate a vector with the existing environment.
         auto buffer = std::vector<T>{};
         struct Deleter {
-            void operator()(T* strings) {
+            void operator()(T *strings) {
                 FreeEnvironmentStrings(strings);
             }
         };
@@ -245,33 +242,27 @@ bool tryLoadSpecialK(bool bUseLoadLibrary = true) {
     return true;
 }
 
-void spawnSKIFQuitThread() {
-    CreateThread(NULL, 0, [](LPVOID) -> DWORD {
-        Sleep(4 * 1000);
-        const auto &&skRegistryPath{ GetSpecialKPathFromRegistry() };
-        if (skRegistryPath) {
-            const auto skLoadPath{ *skRegistryPath + L"\\SKIF.exe" };
-            auto commandLine{ std::to_array(L"SKIF.exe Quit") };
-            if (executeExe(skLoadPath.c_str(), commandLine.data())) {
-                writeLogMessage("Successfully ran `SKIF Quit`");
-            }
-        }
-        return 0;
-    }, NULL, 0, NULL);
-}
-
-void spawnSKIFThread(bool bExecuteSkifQuit = true) {
-    CreateThread(NULL, 0, [](LPVOID) -> DWORD {
-        tryLoadSpecialK(false);
-        return 0;
-    }, NULL, 0, NULL);
+void quitSKIF() {
+    const auto skRegistryPath{ GetSpecialKPathFromRegistry() };
+    if (!skRegistryPath) {
+        return;
+    }
+    const auto skLoadPath{ *skRegistryPath + L"\\SKIF.exe" };
+    auto commandLine{ std::to_array(L"SKIF.exe Quit") };
+    if (executeExe(skLoadPath.c_str(), commandLine.data())) {
+        writeLogMessage("Successfully ran `SKIF Quit`");
+    }
 }
 
 void onReShadePresent(reshade::api::command_queue *,
         reshade::api::swapchain *, const reshade::api::rect *,
         const reshade::api::rect *, uint32_t, const reshade::api::rect *) {
     reshade::unregister_event<reshade::addon_event::present>(&onReShadePresent);
-    spawnSKIFQuitThread();
+    CreateThread(NULL, 0, [](LPVOID) -> DWORD {
+        Sleep(4 * 1000);
+        quitSKIF();
+        return 0;
+    }, NULL, 0, NULL);
 }
 
 void onReShadeBeginEffects(reshade::api::effect_runtime *runtime, reshade::api::command_list *,
@@ -282,7 +273,7 @@ void onReShadeBeginEffects(reshade::api::effect_runtime *runtime, reshade::api::
     }
     auto hwnd = reinterpret_cast<HWND>(runtime->get_hwnd());
     while (hwnd) {
-        const auto szBuffer = 500;
+        constexpr auto szBuffer = 500;
         auto buffer{ std::array<char, szBuffer>{} };
         const auto szWindowText = GetWindowTextA(hwnd, buffer.data(), szBuffer);
         if (szWindowText == 0) {
@@ -312,16 +303,24 @@ void onReShadeCreateEffectRuntime(reshade::api::effect_runtime *runtime) {
 
 void doProcessAttach(HMODULE hModule) {
     DisableThreadLibraryCalls(hModule);
-    const auto szBuffer = MAX_PATH + 1;
-    auto buffer{ std::array<WCHAR, szBuffer>{} };
-    const auto nSize = GetModuleFileName(hModule, buffer.data(), szBuffer);
-    if (nSize == 0) {
-        return;
-    }
-    const auto dllName{ std::filesystem::path{ buffer.data() }.filename() };
-    if (dllName == L"dxgi.dll") {
-        spawnSKIFThread(false);
-    }
+    struct ThreadData {
+        HMODULE hModule;
+    };
+    auto data = new ThreadData{ hModule };
+    CreateThread(NULL, 0, [](LPVOID lpData) -> DWORD {
+        const auto data = std::unique_ptr<ThreadData>{ reinterpret_cast<ThreadData *>(lpData) };
+        constexpr auto szBuffer = MAX_PATH + 1;
+        auto buffer{ std::array<WCHAR, szBuffer>{} };
+        const auto nSize = GetModuleFileName(data->hModule, buffer.data(), szBuffer);
+        if (nSize == 0) {
+            return 0;
+        }
+        const auto dllName{ std::filesystem::path{ buffer.data() }.filename() };
+        if (dllName == L"dxgi.dll") {
+            tryLoadSpecialK(false);
+        }
+        return 0;
+    }, data, 0, NULL);
 }
 
 } // anonymous namespace
