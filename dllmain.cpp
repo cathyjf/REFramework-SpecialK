@@ -109,7 +109,7 @@ void writeLogMessage(const char *message) {
 }
 
 template <class T = wchar_t>
-std::vector<T> getModifiedEnvironmentBlock() {
+auto getModifiedEnvironmentBlock() {
     auto buffer = ([]() {
         // Populate a vector with the existing environment.
         auto buffer = std::vector<T>{};
@@ -214,14 +214,6 @@ bool tryLoadSpecialK(bool bUseLoadLibrary = true) {
         return true;
     }
 
-    static auto bLoadedSpecialK = false;
-    static auto bTriedLoadingSpecialK = false;
-    if (bTriedLoadingSpecialK) {
-        writeLogMessage("Ignored second attempt to load SpecialK");
-        return bLoadedSpecialK;
-    }
-    bTriedLoadingSpecialK = true;
-
     const auto &&skRegistryPath{ GetSpecialKPathFromRegistry() };
     if (!skRegistryPath) {
         writeLogMessage("GetSpecialKPathFromRegistry failed (perhaps Special K is not properly installed?)");
@@ -245,7 +237,6 @@ bool tryLoadSpecialK(bool bUseLoadLibrary = true) {
             writeLogMessage("Successfully ran `SKIF Start Temp`");
         }
     }
-    bLoadedSpecialK = true;
     return true;
 }
 
