@@ -108,6 +108,17 @@ void writeLogMessage(const char *message) {
     }
 }
 
+void writeLogMessage(const wchar_t *message) {
+    const auto length = static_cast<int>(std::wcslen(message) + 1);
+    const auto ansi = std::make_unique<char[]>(length);
+    const auto convertedLength = WideCharToMultiByte(
+        CP_ACP, 0, message, length, ansi.get(), length, nullptr, nullptr);
+    if ((convertedLength == 0) || (ansi[static_cast<std::size_t>(length) - 1] != '\0')) {
+        return;
+    }
+    writeLogMessage(ansi.get());
+}
+
 template <class T = wchar_t>
 auto getModifiedEnvironmentBlock() {
     auto buffer = ([]() {
@@ -206,7 +217,7 @@ bool executeExe(LPCWSTR filename, WCHAR commandLine[], bool waitForExe = false, 
 
 bool tryLoadSpecialK(bool bUseLoadLibrary = true) {
     constexpr auto lpMutexName{ L"Local\\REFrameworkSpecialKRunOnceMutex" };
-    const auto &&hMutex{ CreateMutex(NULL, TRUE, lpMutexName) };
+    const auto hMutex{ CreateMutex(NULL, TRUE, lpMutexName) };
     if (!hMutex) {
         return true;
     }
@@ -214,22 +225,23 @@ bool tryLoadSpecialK(bool bUseLoadLibrary = true) {
         return true;
     }
 
-    const auto &&skRegistryPath{ GetSpecialKPathFromRegistry() };
+    const auto skRegistryPath{ GetSpecialKPathFromRegistry() };
     if (!skRegistryPath) {
         writeLogMessage("GetSpecialKPathFromRegistry failed (perhaps Special K is not properly installed?)");
         return false;
     }
 
-    writeLogMessage("Attempting to load SpecialK...");
+    writeLogMessage((L"Found Special K in " + *skRegistryPath).c_str());
+    writeLogMessage("Attempting to load Special K...");
 
     if (bUseLoadLibrary) {
         const auto skLoadPath{ *skRegistryPath + L"\\SpecialK64.dll" };
         const auto skModule = LoadLibrary(skLoadPath.c_str());
         if (!skModule) {
-            writeLogMessage("Failed to load SpecialK");
+            writeLogMessage("Failed to load Special K");
             return false;
         }
-        writeLogMessage("Successfully loaded SpecialK");
+        writeLogMessage("Successfully loaded Special K");
     } else {
         const auto skLoadPath{ *skRegistryPath + L"\\SKIF.exe" };
         auto commandLine{ std::to_array(L"SKIF.exe Start Temp") };
