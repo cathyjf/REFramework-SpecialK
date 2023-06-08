@@ -210,20 +210,8 @@ bool injectModule(const HMODULE hInjectModule, const HANDLE hProcess) {
         writeLogMessage("Error: Failed to write to memory of target process");
         return false;
     }
-    const auto loadLibraryAddr = ([]() -> LPVOID {
-        const auto hKernel = GetModuleHandle(L"kernel32.dll");
-        if (!hKernel) {
-            writeLogMessage("Error: Failed to get a module handle for kernel32.dll");
-            return nullptr;
-        }
-        return GetProcAddress(hKernel, "LoadLibraryW");
-    })();
-    if (!loadLibraryAddr) {
-        writeLogMessage("Error: Failed to get address for LoadLibraryW in target process");
-        return false;
-    }
     const auto hThread = CreateRemoteThread(hProcess, nullptr, 0,
-        reinterpret_cast<LPTHREAD_START_ROUTINE>(loadLibraryAddr),
+        reinterpret_cast<LPTHREAD_START_ROUTINE>(LoadLibraryW),
         reinterpret_cast<LPVOID *>(dllAddr), 0, nullptr);
     if (!hThread) {
         writeLogMessage("Error: Failed to create remote thread");
@@ -274,7 +262,7 @@ bool tryLoadSpecialK(const HMODULE hThisModule, bool bUseLoadLibrary = true) {
     return true;
 }
 
-void quitSKIF() {
+void quitSkif() {
     const auto skRegistryPath{ GetSpecialKPathFromRegistry() };
     if (!skRegistryPath) {
         return;
@@ -292,7 +280,7 @@ void onReShadePresent(reshade::api::command_queue *,
     reshade::unregister_event<reshade::addon_event::present>(&onReShadePresent);
     CreateThread(NULL, 0, [](LPVOID) -> DWORD {
         Sleep(4 * 1000);
-        quitSKIF();
+        quitSkif();
         return 0;
     }, NULL, 0, NULL);
 }
@@ -333,6 +321,67 @@ void onReShadeCreateEffectRuntime(reshade::api::effect_runtime *runtime) {
     reshade::register_event<reshade::addon_event::reshade_begin_effects>(&onReShadeBeginEffects);
 }
 
+struct HandleCloser {
+    typedef HANDLE pointer;
+    void operator()(HANDLE handle) {
+        CloseHandle(handle);
+    }
+};
+typedef std::unique_ptr<HANDLE, HandleCloser> ManagedHandle;
+
+DWORD getParentPid() {
+    const auto snapshot = ([]() -> ManagedHandle {
+        const auto hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnapshot == INVALID_HANDLE_VALUE) {
+            return nullptr;
+        }
+        return ManagedHandle{ hSnapshot };
+    })();
+    if (!snapshot) {
+        writeLogMessage("Error: CreateToolhelp32Snapshot failed");
+        return 0;
+    }
+    auto entry = PROCESSENTRY32{ .dwSize{ sizeof(PROCESSENTRY32) } };
+    auto success = Process32First(snapshot.get(), &entry);
+    const auto pid = GetCurrentProcessId();
+    while (true) {
+        if (!success) {
+            writeLogMessage("Error: Process32First failed");
+            if (GetLastError() == ERROR_NO_MORE_FILES) {
+                writeLogMessage("(ERROR_NO_MORE_FILES)");
+            }
+            return 0;
+        }
+        if (entry.th32ProcessID == pid) {
+            writeLogMessage("Found this process in the snapshot");
+            return entry.th32ParentProcessID;
+        }
+        success = Process32Next(snapshot.get(), &entry);
+    }
+}
+
+void runSkifLogic() {
+    writeLogMessage("Detected DLL loaded into SKIF process");
+    const auto parentPid = getParentPid();
+    writeLogMessage(static_cast<std::ostringstream &&>((
+        std::ostringstream{} << "Parent PID: " << parentPid)).str().c_str());
+    if (parentPid == 0) {
+        return;
+    }
+    auto parent = ManagedHandle{ OpenProcess(SYNCHRONIZE, false, parentPid) };
+    if (!parent) {
+        writeLogMessage("Failed to open parent process");
+        return;
+    }
+    writeLogMessage("Waiting indefinitely for parent process to close...");
+    if (WaitForSingleObject(parent.get(), INFINITE) == WAIT_FAILED) {
+        writeLogMessage("Failed to wait for parent process");
+        return;
+    }
+    writeLogMessage("Detected that parent process has closed");
+    quitSkif();
+}
+
 void doProcessAttach(HMODULE hModule) {
     DisableThreadLibraryCalls(hModule);
     struct ThreadData {
@@ -350,7 +399,7 @@ void doProcessAttach(HMODULE hModule) {
             if (getExeName() != L"SKIF.exe") {
                 tryLoadSpecialK(data->hModule, false);
             } else {
-                writeLogMessage("Detected DLL loaded into SKIF process");
+                runSkifLogic();
             }
         }
         return 0;
