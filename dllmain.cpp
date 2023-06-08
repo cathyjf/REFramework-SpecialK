@@ -35,6 +35,14 @@ std::filesystem::path getModulePath(const HMODULE module) {
     return buffer.data();
 }
 
+std::filesystem::path getExeName() {
+    const auto path{ getModulePath(NULL) };
+    if (path.empty()) [[unlikely]] {
+        return {};
+    }
+    return path.filename();
+}
+
 std::optional<std::wstring> GetSpecialKPathFromRegistry() {
     HKEY hKey;
     const auto regOpenStatus = RegOpenKeyEx(
@@ -151,9 +159,18 @@ auto getModifiedEnvironmentBlock() {
     return buffer;
 }
 
-bool executeExe(LPCWSTR filename, WCHAR commandLine[], bool waitForExe = false, bool addToJob = false) {
-    auto startupInfo{ STARTUPINFO{ .cb{ sizeof(STARTUPINFO) } } };
-    auto processInformation{ PROCESS_INFORMATION{} };
+struct ProcessInformationDeleter {
+    void operator()(PROCESS_INFORMATION *p) {
+        CloseHandle(p->hProcess);
+        CloseHandle(p->hThread);
+        delete p;
+    }
+};
+typedef std::unique_ptr<PROCESS_INFORMATION, ProcessInformationDeleter> ManagedProcessInformation;
+
+ManagedProcessInformation executeExe(LPCWSTR filename, WCHAR commandLine[]) {
+    auto startupInfo = STARTUPINFO{ .cb{ sizeof(STARTUPINFO) } };
+    auto processInformation = ManagedProcessInformation{ new PROCESS_INFORMATION{} };
 
     // Note: The string used to hold the command line cannot be const because
     // the CreateProcess function reserves the right to modify the string.
@@ -168,54 +185,55 @@ bool executeExe(LPCWSTR filename, WCHAR commandLine[], bool waitForExe = false, 
             &environment[0],            // lpEnvironment
             NULL,  // lpCurrentDirectory
             &startupInfo,
-            &processInformation);
+            processInformation.get());
     if (!bSuccess) {
+        return nullptr;
+    }
+    return processInformation;
+}
+
+bool injectModule(const HMODULE hInjectModule, const HANDLE hProcess) {
+    writeLogMessage("Attempting to inject module into process...");
+    const auto dllPath = getModulePath(hInjectModule).wstring();
+    if (dllPath.empty()) {
+        writeLogMessage("Error: Couldn't get path of module");
         return false;
     }
-
-    if (waitForExe) {
-        WaitForSingleObject(processInformation.hProcess, INFINITE);
+    const auto memoryLength = (dllPath.length() + 1) * sizeof(decltype(dllPath)::value_type);
+	const auto dllAddr = VirtualAllocEx(hProcess, nullptr, memoryLength,
+        MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+    if (!dllAddr) {
+        writeLogMessage("Error: Failed to allocate memory in target process");
+        return false;
     }
-
-    if (addToJob) {
-#if 0 == 1
-        // This code does not work correctly yet.
-        writeLogMessage("Attempting to create job object...");
-        auto hJob = CreateJobObject(nullptr, nullptr);
-        if (hJob) {
-            writeLogMessage("Successfully created job object");
-            auto limitInfo = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
-                JOBOBJECT_BASIC_LIMIT_INFORMATION { .LimitFlags {
-                    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-                } }
-            };
-            auto bSetJobInformation = SetInformationJobObject(
-                hJob, JobObjectExtendedLimitInformation, &limitInfo, sizeof(limitInfo));
-            if (!bSetJobInformation) {
-                writeLogMessage("Failed to set job information");
-                CloseHandle(hJob);
-            } else {
-                writeLogMessage("Successfully set job information");
-                auto bAssignProcess = AssignProcessToJobObject(hJob, processInformation.hProcess);
-                if (!bAssignProcess) {
-                    writeLogMessage("Failed to assign child process to job");
-                    CloseHandle(hJob);
-                } else {
-                    // The handle `hJob` is intentionally not closed at this point.
-                    // It will be closed implicitly when this process terminates.
-                    writeLogMessage("Assigned child process to job");
-                }
-            }
+    if (!WriteProcessMemory(hProcess, dllAddr, dllPath.c_str(), memoryLength, nullptr)) {
+        writeLogMessage("Error: Failed to write to memory of target process");
+        return false;
+    }
+    const auto loadLibraryAddr = ([]() -> LPVOID {
+        const auto hKernel = GetModuleHandle(L"kernel32.dll");
+        if (!hKernel) {
+            writeLogMessage("Error: Failed to get a module handle for kernel32.dll");
+            return nullptr;
         }
-#endif
+        return GetProcAddress(hKernel, "LoadLibraryW");
+    })();
+    if (!loadLibraryAddr) {
+        writeLogMessage("Error: Failed to get address for LoadLibraryW in target process");
+        return false;
     }
-
-    CloseHandle(processInformation.hProcess);
-    CloseHandle(processInformation.hThread);
+    const auto hThread = CreateRemoteThread(hProcess, nullptr, 0,
+        reinterpret_cast<LPTHREAD_START_ROUTINE>(loadLibraryAddr),
+        reinterpret_cast<LPVOID *>(dllAddr), 0, nullptr);
+    if (!hThread) {
+        writeLogMessage("Error: Failed to create remote thread");
+        return false;
+    }
+    writeLogMessage("Successfully injected module into target process");
     return true;
 }
 
-bool tryLoadSpecialK(bool bUseLoadLibrary = true) {
+bool tryLoadSpecialK(const HMODULE hThisModule, bool bUseLoadLibrary = true) {
     constexpr auto lpMutexName{ L"Local\\REFrameworkSpecialKRunOnceMutex" };
     const auto hMutex{ CreateMutex(NULL, TRUE, lpMutexName) };
     if (!hMutex) {
@@ -245,8 +263,12 @@ bool tryLoadSpecialK(bool bUseLoadLibrary = true) {
     } else {
         const auto skLoadPath{ *skRegistryPath + L"\\SKIF.exe" };
         auto commandLine{ std::to_array(L"SKIF.exe Start Temp") };
-        if (executeExe(skLoadPath.c_str(), commandLine.data(), false, true)) {
+        const auto process = executeExe(skLoadPath.c_str(), commandLine.data());
+        if (process) {
             writeLogMessage("Successfully ran `SKIF Start Temp`");
+            if (hThisModule) {
+                injectModule(hThisModule, process->hProcess);
+            }
         }
     }
     return true;
@@ -325,7 +347,11 @@ void doProcessAttach(HMODULE hModule) {
         }
         const auto dllName{ path.filename() };
         if (dllName == L"dxgi.dll") {
-            tryLoadSpecialK(false);
+            if (getExeName() != L"SKIF.exe") {
+                tryLoadSpecialK(data->hModule, false);
+            } else {
+                writeLogMessage("Detected DLL loaded into SKIF process");
+            }
         }
         return 0;
     }, data, 0, NULL);
@@ -337,7 +363,7 @@ extern "C" __declspec(dllexport) bool reframework_plugin_initialize(
         const REFrameworkPluginInitializeParam *param) {
     bUsingREFramework = true;
     reframework::API::initialize(param);
-    return tryLoadSpecialK();
+    return tryLoadSpecialK(NULL);
 }
 
 extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE /*reshade_module*/) {
@@ -349,12 +375,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE addon_module, HMODULE /*
     reshade::register_event<reshade::addon_event::init_effect_runtime>(&onReShadeCreateEffectRuntime);
     writeLogMessage("Add-on successfully registered");
 
-    const auto path{ getModulePath(NULL) };
-    if (path.empty()) [[unlikely]] {
-        return true;
-    }
-    const auto exeName{ path.filename() };
-    if (exeName == L"yuzu.exe") {
+    if (getExeName() == L"yuzu.exe") {
         bUsingReShadeYuzu = true;
         writeLogMessage("Detected running of Yuzu with ReShade");
     }
