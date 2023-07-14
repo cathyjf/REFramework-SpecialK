@@ -6,6 +6,10 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <future>
+#include <chrono>
+
+using namespace std::chrono_literals;
 
 #pragma warning(push)
 #pragma warning(disable : 4267 26110)
@@ -23,7 +27,6 @@ namespace {
 auto bUsingREFramework = false;
 auto bUsingReShade = false;
 auto bUsingReShadeYuzu = false;
-auto bEnableReShadeYuzuEffects = false;
 
 std::filesystem::path getModulePath(const HMODULE module) {
     constexpr auto szBuffer = MAX_PATH + 1;
@@ -287,31 +290,54 @@ void onReShadePresent(reshade::api::command_queue *,
 
 void onReShadeBeginEffects(reshade::api::effect_runtime *runtime, reshade::api::command_list *,
         reshade::api::resource_view, reshade::api::resource_view) {
-    reshade::unregister_event<reshade::addon_event::reshade_begin_effects>(&onReShadeBeginEffects);
-    if (bEnableReShadeYuzuEffects) {
+    static auto future = std::shared_future<bool>{};
+    if (future.valid()) {
+        if (future.wait_for(1ms) != std::future_status::ready) {
+            // Continue waiting for the thread.
+            return;
+        }
+        // We got a result back from the thread.
+        reshade::unregister_event<reshade::addon_event::reshade_begin_effects>(&onReShadeBeginEffects);
+        const auto enableEffects = future.get();
+        writeLogMessage(enableEffects ? "Enabling ReShade effects" : "Disabling ReShade effects");
+        runtime->set_effects_state(enableEffects);
         return;
     }
-    auto hwnd = reinterpret_cast<HWND>(runtime->get_hwnd());
-    while (hwnd) {
-        constexpr auto szBuffer = 500;
-        auto buffer{ std::array<char, szBuffer>{} };
-        const auto szWindowText = GetWindowTextA(hwnd, buffer.data(), szBuffer);
-        if (szWindowText == 0) {
-            writeLogMessage("Failed to obtain the text in the title bar of the window");
-            break;
+
+    // Spawn a thread to figure out which game is running.
+    struct ThreadDataHwnd {
+        HWND hwnd;
+        std::promise<bool> p;
+    };
+    auto data = new ThreadDataHwnd{ reinterpret_cast<HWND>(runtime->get_hwnd()) };
+    future = data->p.get_future().share();
+
+    CreateThread(NULL, 0, [](LPVOID lpData) -> DWORD {
+        auto data = std::unique_ptr<ThreadDataHwnd>{ reinterpret_cast<ThreadDataHwnd *>(lpData) };
+
+        while (data->hwnd) {
+            constexpr auto szBuffer = 500;
+            auto buffer{ std::array<char, szBuffer>{} };
+            writeLogMessage("onReShadeBeginEffects: About to call GetWindowTextA");
+            const auto szWindowText = GetWindowTextA(data->hwnd, buffer.data(), szBuffer);
+            if (szWindowText == 0) {
+                writeLogMessage("Failed to obtain the text in the title bar of the window");
+                data->p.set_value(false);
+                break;
+            }
+            writeLogMessage("onReShadeBeginEffects: About to create `windowTitle` object");
+            const auto windowTitle{ std::string{ buffer.data() } };
+            writeLogMessage(("Window title bar: " + windowTitle).c_str());
+            if (windowTitle.find("The Legend of Zelda: Tears of the Kingdom") != std::string::npos) {
+                data->p.set_value(true);
+                break;
+            }
+            data->hwnd = GetAncestor(data->hwnd, GA_PARENT);
+            writeLogMessage(static_cast<std::ostringstream &&>((
+                std::ostringstream{} << "Parent hwnd: " << data->hwnd)).str().c_str());
         }
-        const auto windowTitle{ std::string{ buffer.data() } };
-        writeLogMessage(("Window title bar: " + windowTitle).c_str());
-        if (windowTitle.find("The Legend of Zelda: Tears of the Kingdom") != std::string::npos) {
-            bEnableReShadeYuzuEffects = true;
-            break;
-        }
-        hwnd = GetAncestor(hwnd, GA_PARENT);
-        writeLogMessage(static_cast<std::ostringstream &&>((
-            std::ostringstream{} << "Parent hwnd: " << hwnd)).str().c_str());
-    }
-    writeLogMessage(bEnableReShadeYuzuEffects ? "Enabling ReShade effects" : "Disabling ReShade effects");
-    runtime->set_effects_state(bEnableReShadeYuzuEffects);
+        return 0;
+    }, data, 0, NULL);
 }
 
 void onReShadeCreateEffectRuntime(reshade::api::effect_runtime *runtime) {
