@@ -141,7 +141,7 @@ auto getModifiedEnvironmentBlock() {
             }
         };
         const auto block = std::unique_ptr<T[], Deleter>{ GetEnvironmentStrings() };
-        for (auto i = 0; ; ++i) {
+        for (auto i = uint64_t{ 0 }; ; ++i) {
             const auto isNull = (block[i] == '\0');
             if (isNull && (i == 0)) {
                 break;
