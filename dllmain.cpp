@@ -278,15 +278,27 @@ void quitSkif() {
     }
 }
 
+struct HandleCloser {
+    typedef HANDLE pointer;
+    void operator()(HANDLE handle) {
+        CloseHandle(handle);
+    }
+};
+typedef std::unique_ptr<HANDLE, HandleCloser> ManagedHandle;
+
+auto CreateThreadManaged(auto&&... args) {
+    return ManagedHandle{ CreateThread(std::forward<decltype(args)>(args)...) };
+}
+
 void onReShadePresent(reshade::api::command_queue *,
         reshade::api::swapchain *, const reshade::api::rect *,
         const reshade::api::rect *, uint32_t, const reshade::api::rect *) {
     reshade::unregister_event<reshade::addon_event::present>(&onReShadePresent);
-    CreateThread(NULL, 0, [](LPVOID) -> DWORD {
+    CreateThreadManaged(nullptr, 0, [](LPVOID) -> DWORD {
         Sleep(4 * 1000);
         quitSkif();
         return 0;
-    }, NULL, 0, NULL);
+    }, nullptr, 0, nullptr);
 }
 
 void onReShadeBeginEffects(reshade::api::effect_runtime *runtime, reshade::api::command_list *,
@@ -306,6 +318,9 @@ void onReShadeBeginEffects(reshade::api::effect_runtime *runtime, reshade::api::
     }
 
     // Spawn a thread to figure out which game is running.
+    // This needs to be done on a separate thread because it calls `GetWindowTextA`.
+    // If `onReShadeBeginEffects` is running on the same thread as the message queue
+    // for the target window, calling `GetWindowTextA` will result in a deadlock.
     struct ThreadDataHwnd {
         HWND hwnd;
         std::promise<bool> p;
@@ -313,7 +328,7 @@ void onReShadeBeginEffects(reshade::api::effect_runtime *runtime, reshade::api::
     auto data = new ThreadDataHwnd{ reinterpret_cast<HWND>(runtime->get_hwnd()) };
     future = data->p.get_future().share();
 
-    CreateThread(NULL, 0, [](LPVOID lpData) -> DWORD {
+    CreateThreadManaged(nullptr, 0, [](LPVOID lpData) -> DWORD {
         auto data = std::unique_ptr<ThreadDataHwnd>{ reinterpret_cast<ThreadDataHwnd *>(lpData) };
 
         while (data->hwnd) {
@@ -338,7 +353,7 @@ void onReShadeBeginEffects(reshade::api::effect_runtime *runtime, reshade::api::
                 std::ostringstream{} << "Parent hwnd: " << data->hwnd)).str().c_str());
         }
         return 0;
-    }, data, 0, NULL);
+    }, data, 0, nullptr);
 }
 
 void onReShadeCreateEffectRuntime(reshade::api::effect_runtime *runtime) {
@@ -347,14 +362,6 @@ void onReShadeCreateEffectRuntime(reshade::api::effect_runtime *runtime) {
     }
     reshade::register_event<reshade::addon_event::reshade_begin_effects>(&onReShadeBeginEffects);
 }
-
-struct HandleCloser {
-    typedef HANDLE pointer;
-    void operator()(HANDLE handle) {
-        CloseHandle(handle);
-    }
-};
-typedef std::unique_ptr<HANDLE, HandleCloser> ManagedHandle;
 
 DWORD getParentPid() {
     const auto snapshot = ([]() -> ManagedHandle {
@@ -415,7 +422,7 @@ void doProcessAttach(HMODULE hModule) {
         HMODULE hModule;
     };
     auto data = new ThreadData{ hModule };
-    CreateThread(NULL, 0, [](LPVOID lpData) -> DWORD {
+    CreateThreadManaged(nullptr, 0, [](LPVOID lpData) -> DWORD {
         const auto data = std::unique_ptr<ThreadData>{ reinterpret_cast<ThreadData *>(lpData) };
         const auto path{ getModulePath(data->hModule) };
         if (path.empty()) [[unlikely]] {
@@ -430,7 +437,7 @@ void doProcessAttach(HMODULE hModule) {
             }
         }
         return 0;
-    }, data, 0, NULL);
+    }, data, 0, nullptr);
 }
 
 } // anonymous namespace
