@@ -21,6 +21,7 @@ using namespace std::chrono_literals;
 #include "externals/reshade/include/reshade.hpp"
 #pragma warning(pop)
 
+#include "dwmapi.proxydll.h"
 #include "dxgi.proxydll.h"
 
 namespace {
@@ -421,7 +422,7 @@ void doProcessAttach(HMODULE hModule) {
             return 0;
         }
         const auto dllName{ path.filename() };
-        if (dllName == L"dxgi.dll") {
+        if ((dllName == L"dxgi.dll") || (dllName == L"dwmapi.dll")) {
             if (getExeName() != L"SKIF.exe") {
                 tryLoadSpecialK(data->hModule, false);
             } else {
