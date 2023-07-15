@@ -295,7 +295,7 @@ void onReShadePresent(reshade::api::command_queue *,
         const reshade::api::rect *, uint32_t, const reshade::api::rect *) {
     reshade::unregister_event<reshade::addon_event::present>(&onReShadePresent);
     CreateThreadManaged(nullptr, 0, [](LPVOID) -> DWORD {
-        Sleep(4 * 1000);
+        std::this_thread::sleep_for(4s);
         quitSkif();
         return 0;
     }, nullptr, 0, nullptr);
