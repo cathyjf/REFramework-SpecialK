@@ -286,19 +286,15 @@ struct HandleCloser {
 };
 typedef std::unique_ptr<HANDLE, HandleCloser> ManagedHandle;
 
-auto CreateThreadManaged(auto&&... args) {
-    return ManagedHandle{ CreateThread(std::forward<decltype(args)>(args)...) };
-}
-
 void onReShadePresent(reshade::api::command_queue *,
         reshade::api::swapchain *, const reshade::api::rect *,
         const reshade::api::rect *, uint32_t, const reshade::api::rect *) {
     reshade::unregister_event<reshade::addon_event::present>(&onReShadePresent);
-    CreateThreadManaged(nullptr, 0, [](LPVOID) -> DWORD {
+    std::thread{ []() {
         std::this_thread::sleep_for(4s);
         quitSkif();
         return 0;
-    }, nullptr, 0, nullptr);
+    } }.detach();
 }
 
 void onReShadeBeginEffects(reshade::api::effect_runtime *runtime, reshade::api::command_list *,
@@ -321,39 +317,33 @@ void onReShadeBeginEffects(reshade::api::effect_runtime *runtime, reshade::api::
     // This needs to be done on a separate thread because it calls `GetWindowTextA`.
     // If `onReShadeBeginEffects` is running on the same thread as the message queue
     // for the target window, calling `GetWindowTextA` will result in a deadlock.
-    struct ThreadDataHwnd {
-        HWND hwnd;
-        std::promise<bool> p;
-    };
-    auto data = new ThreadDataHwnd{ reinterpret_cast<HWND>(runtime->get_hwnd()) };
-    future = data->p.get_future().share();
+    auto hwnd = reinterpret_cast<HWND>(runtime->get_hwnd());
+    auto promise = std::promise<bool>{};
+    future = promise.get_future().share();
 
-    CreateThreadManaged(nullptr, 0, [](LPVOID lpData) -> DWORD {
-        auto data = std::unique_ptr<ThreadDataHwnd>{ reinterpret_cast<ThreadDataHwnd *>(lpData) };
-
-        while (data->hwnd) {
+    std::thread{ [hwnd, promise = std::move(promise)]() mutable {
+        while (hwnd) {
             constexpr auto szBuffer = 500;
             auto buffer{ std::array<char, szBuffer>{} };
             writeLogMessage("onReShadeBeginEffects: About to call GetWindowTextA");
-            const auto szWindowText = GetWindowTextA(data->hwnd, buffer.data(), szBuffer);
+            const auto szWindowText = GetWindowTextA(hwnd, buffer.data(), szBuffer);
             if (szWindowText == 0) {
                 writeLogMessage("Failed to obtain the text in the title bar of the window");
-                data->p.set_value(false);
+                promise.set_value(false);
                 break;
             }
             writeLogMessage("onReShadeBeginEffects: About to create `windowTitle` object");
             const auto windowTitle{ std::string{ buffer.data() } };
             writeLogMessage(("Window title bar: " + windowTitle).c_str());
             if (windowTitle.find("The Legend of Zelda: Tears of the Kingdom") != std::string::npos) {
-                data->p.set_value(true);
+                promise.set_value(true);
                 break;
             }
-            data->hwnd = GetAncestor(data->hwnd, GA_PARENT);
+            hwnd = GetAncestor(hwnd, GA_PARENT);
             writeLogMessage(static_cast<std::ostringstream &&>((
-                std::ostringstream{} << "Parent hwnd: " << data->hwnd)).str().c_str());
+                std::ostringstream{} << "Parent hwnd: " << hwnd)).str().c_str());
         }
-        return 0;
-    }, data, 0, nullptr);
+    } }.detach();
 }
 
 void onReShadeCreateEffectRuntime(reshade::api::effect_runtime *runtime) {
@@ -416,28 +406,22 @@ void runSkifLogic() {
     quitSkif();
 }
 
-void doProcessAttach(HMODULE hModule) {
+void doProcessAttach(const HMODULE hModule) {
     DisableThreadLibraryCalls(hModule);
-    struct ThreadData {
-        HMODULE hModule;
-    };
-    auto data = new ThreadData{ hModule };
-    CreateThreadManaged(nullptr, 0, [](LPVOID lpData) -> DWORD {
-        const auto data = std::unique_ptr<ThreadData>{ reinterpret_cast<ThreadData *>(lpData) };
-        const auto path{ getModulePath(data->hModule) };
+    std::thread{ [hModule]() {
+        const auto path{ getModulePath(hModule) };
         if (path.empty()) [[unlikely]] {
-            return 0;
+            return;
         }
         const auto dllName{ path.filename() };
         if ((dllName == L"dxgi.dll") || (dllName == L"dwmapi.dll")) {
             if (getExeName() != L"SKIF.exe") {
-                tryLoadSpecialK(data->hModule, false);
+                tryLoadSpecialK(hModule, false);
             } else {
                 runSkifLogic();
             }
         }
-        return 0;
-    }, data, 0, nullptr);
+    } }.detach();
 }
 
 } // anonymous namespace
