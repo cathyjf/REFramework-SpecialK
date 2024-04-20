@@ -520,7 +520,7 @@ void doProcessAttach(const HMODULE hModule) {
             return;
         }
         const auto dllName{ path.filename() };
-        if ((dllName != L"dxgi.dll") && (dllName != L"dwmapi.dll") || (dllName == L"dbghelp.dll")) {
+        if ((dllName != L"dxgi.dll") && (dllName != L"dwmapi.dll") && (dllName != L"dbghelp.dll")) {
             return;
         } else if (getExeName() != L"SKIF.exe") {
             tryLoadSpecialKOrRunOtherCommand(hModule);
