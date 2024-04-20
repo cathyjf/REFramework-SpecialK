@@ -25,6 +25,8 @@ using namespace std::chrono_literals;
 #include "dxgi.proxydll.h"
 
 namespace {
+constexpr auto CONFIG_FILENAME = L"cathyjf-config.ini";
+
 auto bUsingREFramework = false;
 auto bUsingReShade = false;
 auto bUsingReShadeYuzu = false;
@@ -142,13 +144,13 @@ auto getModifiedEnvironmentBlock() {
             }
         };
         const auto block = std::unique_ptr<T[], Deleter>{ GetEnvironmentStrings() };
-        for (auto i = uint64_t{ 0 }; ; ++i) {
-            const auto isNull = (block[i] == '\0');
+        for (auto i = size_t{ 0 }; ; ++i) {
+            const auto isNull = (block[i] == L'\0');
             if (isNull && (i == 0)) {
                 break;
             }
             buffer.emplace_back(block[i]);
-            if (isNull && (block[i + 1] == '\0')) {
+            if (isNull && (block[i + 1] == L'\0')) {
                 break;
             }
         }
@@ -172,14 +174,20 @@ struct ProcessInformationDeleter {
 };
 typedef std::unique_ptr<PROCESS_INFORMATION, ProcessInformationDeleter> ManagedProcessInformation;
 
-ManagedProcessInformation executeExe(LPCWSTR filename, WCHAR commandLine[]) {
+auto executeExe(
+        LPCWSTR filename, WCHAR commandLine[],
+        std::optional<std::function<void(LPSTARTUPINFO)>> startupFunc = std::nullopt
+) -> ManagedProcessInformation {
     auto startupInfo = STARTUPINFO{ .cb{ sizeof(STARTUPINFO) } };
+    if (startupFunc) {
+        (*startupFunc)(&startupInfo);
+    }
     auto processInformation = ManagedProcessInformation{ new PROCESS_INFORMATION{} };
 
     // Note: The string used to hold the command line cannot be const because
     // the CreateProcess function reserves the right to modify the string.
     auto environment = getModifiedEnvironmentBlock();
-    const auto bSuccess = CreateProcess(
+    const auto bSuccess = CreateProcessW(
             filename,
             commandLine,
             NULL,  // lpProcessAttributes
@@ -406,6 +414,60 @@ void runSkifLogic() {
     quitSkif();
 }
 
+auto runPowerShellScript(const std::wstring_view script) {
+    if (auto stream = std::wostringstream{}) {
+        stream << L"Found request to run PowerShell script: " << script;
+        writeLogMessage(stream.str().c_str());
+    }
+    if (!std::filesystem::exists(script)) {
+        writeLogMessage("Specified PowerShell script does not exist");
+        return;
+    }
+    const auto commandLineString = (
+        std::wostringstream{} << L"powershell -ExecutionPolicy Unrestricted -File \"" << script << L"\""
+    ).str();
+    // Unfortunately, we need a modifiable string to pass to CreateProcessW.
+    // This requires us to make a copy of the data returned by the wostringstream.
+    auto modifiableString = std::make_unique<wchar_t[]>(std::size(commandLineString) + 1);
+    memcpy(modifiableString.get(), commandLineString.data(), std::size(commandLineString));
+    modifiableString[std::size(commandLineString)] = L'\0';
+
+    const auto procInfo = executeExe(nullptr, modifiableString.get(), [](LPSTARTUPINFO info) -> void {
+        info->dwFlags = STARTF_USESHOWWINDOW;
+        info->wShowWindow = SW_MINIMIZE;
+    });
+    if (procInfo == nullptr) {
+        writeLogMessage("CreateProcessW failed");
+        return;
+    }
+    writeLogMessage("Successfully ran the PowerShell script");
+}
+
+auto tryLoadSpecialKOrRunOtherCommand(const auto hModule) {
+    auto exePath = getModulePath(NULL);
+    if (!exePath.empty()) {
+        exePath.replace_filename(CONFIG_FILENAME);
+        if (std::filesystem::exists(exePath)) {
+            if (auto stream = std::wostringstream{}) {
+                stream << L"Found config file: " << exePath.wstring();
+                writeLogMessage(stream.str().c_str());
+            }
+            auto buffer = std::array<wchar_t, 500>{};
+            const auto retSize = GetPrivateProfileStringW(
+                L"init", L"powershell",
+                nullptr, // default value
+                buffer.data(), static_cast<DWORD>(std::size(buffer)),
+                exePath.wstring().c_str());
+            if (retSize > 0) {
+                runPowerShellScript({ buffer.data(), std::size(buffer)});
+                // In this situation, we won't launch SpecialK.
+                return;
+            }
+        }
+    }
+    tryLoadSpecialK(hModule, false);
+}
+
 void doProcessAttach(const HMODULE hModule) {
     DisableThreadLibraryCalls(hModule);
     std::thread{ [hModule]() {
@@ -414,12 +476,12 @@ void doProcessAttach(const HMODULE hModule) {
             return;
         }
         const auto dllName{ path.filename() };
-        if ((dllName == L"dxgi.dll") || (dllName == L"dwmapi.dll")) {
-            if (getExeName() != L"SKIF.exe") {
-                tryLoadSpecialK(hModule, false);
-            } else {
-                runSkifLogic();
-            }
+        if ((dllName != L"dxgi.dll") && (dllName != L"dwmapi.dll")) {
+            return;
+        } else if (getExeName() != L"SKIF.exe") {
+            tryLoadSpecialKOrRunOtherCommand(hModule);
+        } else {
+            runSkifLogic();
         }
     } }.detach();
 }
