@@ -25,6 +25,8 @@ using namespace std::chrono_literals;
 #include "dwmapi.proxydll.h"
 #include "dxgi.proxydll.h"
 
+#include "externals/detours/include/detours.h"
+
 namespace {
 constexpr auto CONFIG_FILENAME = L"cathyjf-config.ini";
 
@@ -424,8 +426,8 @@ auto runPowerShellScript(const std::wstring_view script) {
         writeLogMessage("Specified PowerShell script does not exist");
         return;
     }
-    const auto commandLineString = (
-        std::wostringstream{} << L"powershell -ExecutionPolicy Unrestricted -File \"" << script << L"\""
+    const auto commandLineString = (std::wostringstream{} <<
+        L"powershell -ExecutionPolicy Unrestricted -File \"" << script << L"\""
     ).str();
     // Unfortunately, we need a modifiable string to pass to CreateProcessW.
     // This requires us to make a copy of the data returned by the wostringstream.
@@ -444,7 +446,50 @@ auto runPowerShellScript(const std::wstring_view script) {
     writeLogMessage("Successfully ran the PowerShell script");
 }
 
+struct ConfigData {
+    bool loadSpecialK = true;
+    std::optional<std::wstring> powerShellScript = std::nullopt;
+    bool hideCursor = false;
+};
+
+auto parseConfigFile(const auto file, ConfigData &config) {
+    // This buffer can be re-used throughout this function.
+    auto buffer = std::array<wchar_t, 500>{};
+
+    // [string] init.powershell - run a specified PowerShell script
+    const auto retSize = GetPrivateProfileStringW(
+        L"Init", L"PowerShell",
+        nullptr, // default value
+        buffer.data(), static_cast<DWORD>(std::size(buffer)),
+        file.c_str());
+    if (retSize > 0) {
+        config.powerShellScript = std::wstring{ buffer.data(), std::size(buffer) };
+        // In this situation, we won't launch SpecialK.
+        config.loadSpecialK = false;
+    }
+
+    // [0 or 1] init.hideCursor - hide mouse cursor
+    config.hideCursor = !!GetPrivateProfileIntW(
+        L"Init", L"HideCursor",
+        0, // default value
+        file.c_str());
+}
+
+auto SetCursor_Original = SetCursor;
+
+auto SetCursor_Replacement(HCURSOR /*hCursor*/) -> HCURSOR {
+    return SetCursor_Original(NULL);
+}
+
+auto tryHideMouseCursor() {
+    writeLogMessage("Attempting to hide mouse cursor...");
+    DetourTransactionBegin();
+    DetourAttach(reinterpret_cast<void **>(&SetCursor_Original), SetCursor_Replacement);
+    DetourTransactionCommit();
+}
+
 auto tryLoadSpecialKOrRunOtherCommand(const auto hModule) {
+    auto config = ConfigData{};
     auto exePath = getModulePath(NULL);
     if (!exePath.empty()) {
         exePath.replace_filename(CONFIG_FILENAME);
@@ -453,20 +498,18 @@ auto tryLoadSpecialKOrRunOtherCommand(const auto hModule) {
                 stream << L"Found config file: " << exePath.wstring();
                 writeLogMessage(stream.str().c_str());
             }
-            auto buffer = std::array<wchar_t, 500>{};
-            const auto retSize = GetPrivateProfileStringW(
-                L"init", L"powershell",
-                nullptr, // default value
-                buffer.data(), static_cast<DWORD>(std::size(buffer)),
-                exePath.wstring().c_str());
-            if (retSize > 0) {
-                runPowerShellScript({ buffer.data(), std::size(buffer)});
-                // In this situation, we won't launch SpecialK.
-                return;
-            }
+            parseConfigFile(exePath.wstring(), config);
         }
     }
-    tryLoadSpecialK(hModule, false);
+    if (config.powerShellScript) {
+        runPowerShellScript(*config.powerShellScript);
+    }
+    if (config.hideCursor) {
+        tryHideMouseCursor();
+    }
+    if (config.loadSpecialK) {
+        tryLoadSpecialK(hModule, false);
+    }
 }
 
 void doProcessAttach(const HMODULE hModule) {
